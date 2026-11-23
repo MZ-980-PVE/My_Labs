@@ -20,6 +20,9 @@
     reset_all_settings: false    # true – сбросить ВСЕ настройки
     reboot_after: false          # true – перезагрузить HQ-CLI
     desktop_keep: []             # что еще оставить на столе
+    # стандартные ярлыки Alt (берутся из /usr/share/applications)
+    desktop_shortcuts:
+      - indexhtml.desktop
     home_keep: []                # что еще оставить в домашнем
 
     # стандартные каталоги, если xdg-user-dir недоступна
@@ -124,10 +127,12 @@
         file_type: any
       register: skel_home
 
-    - name: Стандартные ярлыки рабочего стола
+    - name: Стандартные ярлыки рабочего стола в /etc/skel
       ansible.builtin.find:
-        paths: "/etc/skel/{{ desktop_dir | basename }}"
-        file_type: any
+        paths:
+          - "/etc/skel/{{ desktop_dir | basename }}"
+          - /etc/skel/Desktop
+        file_type: file
       register: skel_desktop
 
     - name: Списки того, что оставить
@@ -140,7 +145,8 @@
         keep_desktop: >-
           {{ ([group_name]
               + (skel_desktop.files | map(attribute='path')
-                 | map('basename') | list) + desktop_keep)
+                 | map('basename') | list)
+              + desktop_shortcuts + desktop_keep)
              | map('regex_replace', '^', desktop_dir ~ '/') | list }}
 
     # ================================================================
@@ -222,14 +228,37 @@
         label: "{{ item.path | basename }}"
       register: del_desk
 
-    - name: Вернуть стандартные ярлыки из /etc/skel
+    - name: Вернуть ярлыки из /etc/skel
       ansible.builtin.copy:
-        src: "/etc/skel/{{ desktop_dir | basename }}/"
-        dest: "{{ desktop_dir }}/"
+        src: "{{ item.path }}"
+        dest: "{{ desktop_dir }}/{{ item.path | basename }}"
         remote_src: true
+        force: false               # уже есть – не трогать
         owner: "{{ cli_user }}"
         group: "{{ cli_user }}"
-      when: skel_desktop.matched | int > 0
+        mode: "0755"
+      loop: "{{ skel_desktop.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Найти стандартные ярлыки Alt
+      ansible.builtin.stat:
+        path: "/usr/share/applications/{{ item }}"
+      loop: "{{ desktop_shortcuts }}"
+      register: std_lnk
+
+    - name: Вернуть стандартные ярлыки Alt
+      ansible.builtin.copy:
+        src: "{{ item.stat.path }}"
+        dest: "{{ desktop_dir }}/{{ item.item }}"
+        remote_src: true
+        force: false
+        owner: "{{ cli_user }}"
+        group: "{{ cli_user }}"
+        mode: "0755"
+      loop: "{{ std_lnk.results | selectattr('stat.exists') | list }}"
+      loop_control:
+        label: "{{ item.item }}"
 
     - name: Каталог группы на рабочем столе
       ansible.builtin.file:
