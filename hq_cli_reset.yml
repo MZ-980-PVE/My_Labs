@@ -13,7 +13,7 @@
   become_method: su            # пароль root HQ-CLI – ключ -K
 
   vars:
-    group_name: "СА-24-1"          # каталог на рабочем столе
+    group_name: "SA-24-1"          # каталог на рабочем столе
     cli_user: user               # чей рабочий стол чистим
     timezone: Europe/Moscow
     clean_standard_dirs: true    # очистить Документы, Загрузки…
