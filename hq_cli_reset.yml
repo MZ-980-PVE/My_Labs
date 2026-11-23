@@ -1,0 +1,284 @@
+---
+# =====================================================================
+#  Приведение HQ-CLI к «чистому» виду перед занятием
+#  Запуск на BR-SRV из /etc/ansible:
+#    ansible-playbook hq_cli_reset.yml -K --check --diff   что удалится
+#    ansible-playbook hq_cli_reset.yml -K                  выполнить
+# =====================================================================
+
+- name: Чистый рабочий стол HQ-CLI
+  hosts: HQ-CLI
+  gather_facts: false
+  become: true
+  become_method: su            # пароль root HQ-CLI – ключ -K
+
+  vars:
+    group_name: "ИС-21"          # каталог на рабочем столе
+    cli_user: user               # чей рабочий стол чистим
+    timezone: Europe/Moscow
+    clean_standard_dirs: true    # очистить Документы, Загрузки…
+    reset_all_settings: false    # true – сбросить ВСЕ настройки
+    reboot_after: false          # true – перезагрузить HQ-CLI
+    desktop_keep: []             # что еще оставить на столе
+    home_keep: []                # что еще оставить в домашнем
+
+    # стандартные каталоги, если xdg-user-dir недоступна
+    default_std_names:
+      - Рабочий стол
+      - Документы
+      - Загрузки
+      - Изображения
+      - Музыка
+      - Видео
+      - Шаблоны
+      - Общедоступные
+    # что сбрасывается в настройках рабочего стола
+    dconf_paths:
+      - /org/gnome/desktop/background/
+      - /org/gnome/desktop/screensaver/
+      - /org/mate/desktop/background/
+      - /org/mate/screensaver/
+      - /org/mate/caja/desktop/
+
+  tasks:
+    # ================================================================
+    # 0. Проверки
+    # ================================================================
+    - name: Плейбук подключается от имени cli_user
+      ansible.builtin.assert:
+        that: (ansible_user | default(cli_user)) == cli_user
+        fail_msg: >-
+          В инвентаре ansible_user={{ ansible_user }}, а cli_user={{ cli_user }}.
+          Настройки рабочего стола меняются от имени пользователя
+          подключения – сделайте их одинаковыми.
+
+    - name: Домашний каталог пользователя
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ cli_user }}"
+
+    - name: Запомнить путь к домашнему каталогу
+      ansible.builtin.set_fact:
+        home: "{{ ansible_facts.getent_passwd[cli_user][4] }}"
+
+    - name: Домашний каталог находится в /home
+      ansible.builtin.assert:
+        that: home is match('^/home/[^/]+$')
+        fail_msg: "Странный домашний каталог: {{ home }}"
+
+    # ================================================================
+    # 1. Часовой пояс
+    # ================================================================
+    - name: Часовой пояс
+      community.general.timezone:
+        name: "{{ timezone }}"
+      tags: time
+
+    # ================================================================
+    # 2. Где лежат стандартные каталоги
+    # ================================================================
+    - name: Узнать пути стандартных каталогов
+      ansible.builtin.command: "xdg-user-dir {{ item }}"
+      loop: [DESKTOP, DOCUMENTS, DOWNLOAD, MUSIC,
+             PICTURES, PUBLICSHARE, TEMPLATES, VIDEOS]
+      register: xdg
+      become: false
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Список стандартных каталогов
+      ansible.builtin.set_fact:
+        xdg_ok: "{{ xdg.results | selectattr('rc', 'eq', 0)
+                    | rejectattr('stdout', 'eq', home) | list }}"
+
+    - name: Пути рабочего стола, шаблонов и всех стандартных
+      ansible.builtin.set_fact:
+        std_dirs: >-
+          {{ (xdg_ok | map(attribute='stdout') | list)
+             if xdg_ok | length > 0 else
+             (default_std_names | map('regex_replace', '^', home ~ '/')
+              | list) }}
+        desktop_dir: >-
+          {{ (xdg_ok | selectattr('item', 'eq', 'DESKTOP')
+              | map(attribute='stdout') | first)
+             | default(home ~ '/Рабочий стол') }}
+        templates_dir: >-
+          {{ (xdg_ok | selectattr('item', 'eq', 'TEMPLATES')
+              | map(attribute='stdout') | first)
+             | default(home ~ '/Шаблоны') }}
+
+    # ================================================================
+    # 3. Что было «после установки» – содержимое /etc/skel
+    # ================================================================
+    - name: Стандартное содержимое домашнего каталога
+      ansible.builtin.find:
+        paths: /etc/skel
+        file_type: any
+      register: skel_home
+
+    - name: Стандартные ярлыки рабочего стола
+      ansible.builtin.find:
+        paths: "/etc/skel/{{ desktop_dir | basename }}"
+        file_type: any
+      register: skel_desktop
+
+    - name: Списки того, что оставить
+      ansible.builtin.set_fact:
+        keep_home: >-
+          {{ std_dirs + [desktop_dir, templates_dir]
+             + (skel_home.files | map(attribute='path')
+                | map('basename') | list + home_keep)
+               | map('regex_replace', '^', home ~ '/') | list }}
+        keep_desktop: >-
+          {{ ([group_name]
+              + (skel_desktop.files | map(attribute='path')
+                 | map('basename') | list) + desktop_keep)
+             | map('regex_replace', '^', desktop_dir ~ '/') | list }}
+
+    # ================================================================
+    # 4. Уборка домашнего каталога
+    # ================================================================
+    - name: Найти файлы и каталоги в домашнем каталоге
+      ansible.builtin.find:
+        paths: "{{ home }}"
+        file_type: any
+      register: home_items
+
+    - name: Удалить лишнее из домашнего каталога
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ home_items.files
+                | rejectattr('path', 'in', keep_home) | list }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: del_home
+
+    - name: Стандартные каталоги на месте
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ cli_user }}"
+        group: "{{ cli_user }}"
+        mode: "0755"
+      loop: "{{ std_dirs }}"
+
+    - name: Очистить корзину
+      ansible.builtin.file:
+        path: "{{ home }}/.local/share/Trash"
+        state: absent
+
+    - name: Найти содержимое стандартных каталогов
+      ansible.builtin.find:
+        paths: "{{ std_dirs | difference([desktop_dir, templates_dir]) }}"
+        file_type: any
+        hidden: true
+      register: std_items
+      when: clean_standard_dirs | bool
+
+    - name: Очистить Документы, Загрузки, Изображения…
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ std_items.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: del_std
+      when: clean_standard_dirs | bool
+
+    # ================================================================
+    # 5. Рабочий стол
+    # ================================================================
+    - name: Каталог рабочего стола существует
+      ansible.builtin.file:
+        path: "{{ desktop_dir }}"
+        state: directory
+        owner: "{{ cli_user }}"
+        group: "{{ cli_user }}"
+        mode: "0755"
+
+    - name: Найти файлы и каталоги на рабочем столе
+      ansible.builtin.find:
+        paths: "{{ desktop_dir }}"
+        file_type: any
+        hidden: true
+      register: desk_items
+
+    - name: Удалить с рабочего стола все, кроме стандартного
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ desk_items.files
+                | rejectattr('path', 'in', keep_desktop) | list }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: del_desk
+
+    - name: Вернуть стандартные ярлыки из /etc/skel
+      ansible.builtin.copy:
+        src: "/etc/skel/{{ desktop_dir | basename }}/"
+        dest: "{{ desktop_dir }}/"
+        remote_src: true
+        owner: "{{ cli_user }}"
+        group: "{{ cli_user }}"
+      when: skel_desktop.matched | int > 0
+
+    - name: Каталог группы на рабочем столе
+      ansible.builtin.file:
+        path: "{{ desktop_dir }}/{{ group_name }}"
+        state: directory
+        owner: "{{ cli_user }}"
+        group: "{{ cli_user }}"
+        mode: "0755"
+
+    # ================================================================
+    # 6. Стандартные обои, заставка и вид рабочего стола
+    # ================================================================
+    - name: Есть ли dconf на компьютере
+      ansible.builtin.stat:
+        path: /usr/bin/dconf
+      register: dconf_bin
+
+    - name: Какие настройки пользователь менял
+      ansible.builtin.command: >-
+        dbus-run-session dconf dump {{ item }}
+      loop: "{{ ['/'] if reset_all_settings | bool else dconf_paths }}"
+      register: dconf_dump
+      become: false
+      changed_when: false
+      check_mode: false
+      when: dconf_bin.stat.exists
+
+    - name: Вернуть стандартные значения
+      ansible.builtin.command: >-
+        dbus-run-session dconf reset -f {{ item.item }}
+      loop: "{{ dconf_dump.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      become: false
+      when:
+        - dconf_bin.stat.exists
+        - item.stdout | default('') | length > 0
+
+    - name: Перезагрузить HQ-CLI, чтобы применились обои
+      ansible.builtin.reboot:
+        msg: "Компьютер перезагружается администратором"
+      when: reboot_after | bool
+      tags: reboot
+
+    # ================================================================
+    # 7. Итог
+    # ================================================================
+    - name: Итог
+      ansible.builtin.debug:
+        msg:
+          - "Рабочий стол: {{ desktop_dir }}"
+          - "Каталог группы: {{ group_name }}"
+          - "Удалено из домашнего каталога: {{ del_home.results
+             | selectattr('changed') | list | length }}"
+          - "Удалено с рабочего стола: {{ del_desk.results
+             | selectattr('changed') | list | length }}"
+          - "Удалено из стандартных каталогов: {{ (del_std.results
+             | default([])) | selectattr('changed') | list | length }}"
+          - "Обои и заставка применятся после повторного входа"
