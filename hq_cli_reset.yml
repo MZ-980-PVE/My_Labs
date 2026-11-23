@@ -69,9 +69,16 @@
     # ================================================================
     # 1. Часовой пояс
     # ================================================================
+    - name: Текущий часовой пояс
+      ansible.builtin.command: timedatectl show -p Timezone --value
+      register: tz_now
+      changed_when: false
+      check_mode: false
+      tags: time
+
     - name: Часовой пояс
-      community.general.timezone:
-        name: "{{ timezone }}"
+      ansible.builtin.command: "timedatectl set-timezone {{ timezone }}"
+      when: tz_now.stdout != timezone
       tags: time
 
     # ================================================================
